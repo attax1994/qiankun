@@ -40,8 +40,9 @@ export function registerMicroApps<T extends object = {}>(
         loader(true);
         await frameworkStartedDefer.promise;
 
-        const { mount, ...otherMicroAppConfigs } = // 加载App
-        (await loadApp({ name, props, ...appConfig }, frameworkConfiguration, lifeCycles))();
+        const { mount, ...otherMicroAppConfigs } = ( // 加载App
+          await loadApp({ name, props, ...appConfig }, frameworkConfiguration, lifeCycles)
+        )();
 
         return {
           mount: [async () => loader(true), ...toArray(mount), async () => loader(false)],
