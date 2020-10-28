@@ -219,6 +219,13 @@ function getLifecyclesFromExports(scriptExports: LifeCycles<any>, appName: strin
 let prevAppUnmountedDeferred: Deferred<void>;
 
 export type ParcelConfigObjectGetter = (remountContainer?: string | HTMLElement) => ParcelConfigObject;
+
+/**
+ * 在符合路由规则后，加载App的相关资源，包括html模板，html中对应的 js、css 资源
+ * @param app
+ * @param configuration
+ * @param lifeCycles
+ */
 export async function loadApp<T extends object>(
   app: LoadableApp<T>,
   configuration: FrameworkConfiguration = {},
@@ -234,7 +241,10 @@ export async function loadApp<T extends object>(
 
   const { singular = false, sandbox = true, excludeAssetFilter, ...importEntryOpts } = configuration;
 
-  // get the entry html content and script executor
+  /**
+   * 获取入口html文本，抽取出其 js 和 css 资源
+   * 详见：https://github.com/kuitos/import-html-entry
+   */
   const { template, execScripts, assetPublicPath } = await importEntry(entry, importEntryOpts);
 
   // as single-spa load and bootstrap new app parallel with other apps unmounting
@@ -244,8 +254,15 @@ export async function loadApp<T extends object>(
     await (prevAppUnmountedDeferred && prevAppUnmountedDeferred.promise);
   }
 
+  /**
+   * 准备一个div容器，放置App
+   * 1. 生成模板
+   * 2. 判断是否需要样式隔离
+   *  2.1 样式隔离采用 shadow-dom 的方案（如果浏览器不支持该特性，则忽略样式隔离，采用约定方案）
+   * 3. 生成对应容器元素
+   * 4. 如果使用了 scoped-css (类似vue)，改造对应<style>内容
+   */
   const appContent = getDefaultTplWrapper(appInstanceId, appName)(template);
-
   const strictStyleIsolation = typeof sandbox === 'object' && !!sandbox.strictStyleIsolation;
   let appWrapperElement: HTMLElement | null = createElement(appContent, strictStyleIsolation);
   const enableScopedCSS = isEnableScopedCSS(sandbox);
@@ -259,6 +276,10 @@ export async function loadApp<T extends object>(
   const container = 'container' in app ? app.container : undefined;
   const legacyRender = 'render' in app ? app.render : undefined;
 
+  /**
+   * 主程序render
+   * 本质是将元素通过 appendChild 挂载到指定的container上
+   */
   const render = getRender(appName, appContent, container, legacyRender);
 
   // 第一次加载设置应用可见区域 dom 结构
@@ -274,6 +295,9 @@ export async function loadApp<T extends object>(
     () => appWrapperElement,
   );
 
+  /**
+   * 为该App新建沙箱，获得代理的window
+   */
   let global = window;
   let mountSandbox = () => Promise.resolve();
   let unmountSandbox = () => Promise.resolve();
@@ -299,6 +323,14 @@ export async function loadApp<T extends object>(
     (v1, v2) => concat(v1 ?? [], v2 ?? []),
   );
 
+  /**
+   * 以下涉及到各个生命周期钩子
+   * 1. 执行beforeLoad
+   * 2. 使用 eval 函数执行 entry 的 js 文本，获得导出的模块(也是选用webpack umd打包方式的原因)
+   * 3. 提供 onGlobalStateChange、setGlobalState、offGlobalStateChange 三个全局通信方法，
+   *    以便植入子应用 mount 钩子的 props 中
+   * 4. 将入口提供的 bootstrap、mount、unmount 钩子打包给 single-spa 使用
+   */
   await execHooksChain(toArray(beforeLoad), app, global);
 
   // get the lifecycle hooks from module exports
