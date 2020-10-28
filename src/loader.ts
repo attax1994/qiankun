@@ -53,7 +53,12 @@ async function validateSingularMode<T extends object>(
 
 // @ts-ignore
 const supportShadowDOM = document.head.attachShadow || document.head.createShadowRoot;
-function createElement(appContent: string, strictStyleIsolation: boolean): HTMLElement {
+function createElement(
+  appContent: string,
+  strictStyleIsolation: boolean,
+  scopedCSS: boolean,
+  appName: string,
+): HTMLElement {
   const containerElement = document.createElement('div');
   containerElement.innerHTML = appContent;
   // appContent always wrapped with a singular div
@@ -78,6 +83,18 @@ function createElement(appContent: string, strictStyleIsolation: boolean): HTMLE
     }
   }
 
+  if (scopedCSS) {
+    const attr = appElement.getAttribute(css.QiankunCSSRewriteAttr);
+    if (!attr) {
+      appElement.setAttribute(css.QiankunCSSRewriteAttr, appName);
+    }
+
+    const styleNodes = appElement.querySelectorAll('style') || [];
+    forEach(styleNodes, (stylesheetElement: HTMLStyleElement) => {
+      css.process(appElement!, stylesheetElement, appName);
+    });
+  }
+
   return appElement;
 }
 
@@ -87,13 +104,13 @@ function getAppWrapperGetter(
   appInstanceId: string,
   useLegacyRender: boolean,
   strictStyleIsolation: boolean,
-  enableScopedCSS: boolean,
+  scopedCSS: boolean,
   elementGetter: () => HTMLElement | null,
 ) {
   return () => {
     if (useLegacyRender) {
       if (strictStyleIsolation) throw new Error('[qiankun]: strictStyleIsolation can not be used with legacy render!');
-      if (enableScopedCSS) throw new Error('[qiankun]: experimentalStyleIsolation can not be used with legacy render!');
+      if (scopedCSS) throw new Error('[qiankun]: experimentalStyleIsolation can not be used with legacy render!');
 
       const appWrapper = document.getElementById(getWrapperId(appInstanceId));
       assertElementExist(
@@ -109,13 +126,6 @@ function getAppWrapperGetter(
       `[qiankun] Wrapper element for ${appName} with instance ${appInstanceId} is not existed!`,
     );
 
-    if (enableScopedCSS) {
-      const attr = element!.getAttribute(css.QiankunCSSRewriteAttr);
-      if (!attr) {
-        element!.setAttribute(css.QiankunCSSRewriteAttr, appName);
-      }
-    }
-
     if (strictStyleIsolation) {
       return element!.shadowRoot!;
     }
@@ -127,7 +137,7 @@ function getAppWrapperGetter(
 const rawAppendChild = HTMLElement.prototype.appendChild;
 const rawRemoveChild = HTMLElement.prototype.removeChild;
 type ElementRender = (
-  props: { element: HTMLElement | null; loading: boolean; remountContainer?: string | HTMLElement },
+  props: { element: HTMLElement | null; loading: boolean; container?: string | HTMLElement },
   phase: 'loading' | 'mounting' | 'mounted' | 'unmounted',
 ) => any;
 
@@ -136,16 +146,10 @@ type ElementRender = (
  * If the legacy render function is provide, used as it, otherwise we will insert the app element to target container by qiankun
  * @param appName
  * @param appContent
- * @param container
  * @param legacyRender
  */
-function getRender(
-  appName: string,
-  appContent: string,
-  container?: string | HTMLElement,
-  legacyRender?: HTMLContentRender,
-) {
-  const render: ElementRender = ({ element, loading, remountContainer }, phase) => {
+function getRender(appName: string, appContent: string, legacyRender?: HTMLContentRender) {
+  const render: ElementRender = ({ element, loading, container }, phase) => {
     if (legacyRender) {
       if (process.env.NODE_ENV === 'development') {
         console.warn(
@@ -156,7 +160,7 @@ function getRender(
       return legacyRender({ loading, appContent: element ? appContent : '' });
     }
 
-    const containerElement = getContainer(remountContainer || container!);
+    const containerElement = getContainer(container!);
 
     // The container might have be removed after micro app unmounted.
     // Such as the micro app unmount lifecycle called by a react componentWillUnmount lifecycle, after micro app unmounted, the react component might also be removed
@@ -264,35 +268,35 @@ export async function loadApp<T extends object>(
    */
   const appContent = getDefaultTplWrapper(appInstanceId, appName)(template);
   const strictStyleIsolation = typeof sandbox === 'object' && !!sandbox.strictStyleIsolation;
-  let appWrapperElement: HTMLElement | null = createElement(appContent, strictStyleIsolation);
-  const enableScopedCSS = isEnableScopedCSS(sandbox);
-  if (appWrapperElement && enableScopedCSS) {
-    const styleNodes = appWrapperElement.querySelectorAll('style') || [];
-    forEach(styleNodes, (stylesheetElement: HTMLStyleElement) => {
-      css.process(appWrapperElement!, stylesheetElement, appName);
-    });
-  }
+  const scopedCSS = isEnableScopedCSS(sandbox);
+  let initialAppWrapperElement: HTMLElement | null = createElement(
+    appContent,
+    strictStyleIsolation,
+    scopedCSS,
+    appName,
+  );
 
-  const container = 'container' in app ? app.container : undefined;
+  const initialContainer = 'container' in app ? app.container : undefined;
   const legacyRender = 'render' in app ? app.render : undefined;
+
 
   /**
    * 主程序render
    * 本质是将元素通过 appendChild 挂载到指定的container上
    */
-  const render = getRender(appName, appContent, container, legacyRender);
+  const render = getRender(appName, appContent, legacyRender);
 
   // 第一次加载设置应用可见区域 dom 结构
   // 确保每次应用加载前容器 dom 结构已经设置完毕
-  render({ element: appWrapperElement, loading: true }, 'loading');
+  render({ element: initialAppWrapperElement, loading: true, container: initialContainer }, 'loading');
 
-  const appWrapperGetter = getAppWrapperGetter(
+  const initialAppWrapperGetter = getAppWrapperGetter(
     appName,
     appInstanceId,
     !!legacyRender,
     strictStyleIsolation,
-    enableScopedCSS,
-    () => appWrapperElement,
+    scopedCSS,
+    () => initialAppWrapperElement,
   );
 
   /**
@@ -305,8 +309,9 @@ export async function loadApp<T extends object>(
   if (sandbox) {
     const sandboxInstance = createSandbox(
       appName,
-      appWrapperGetter,
-      enableScopedCSS,
+      // FIXME should use a strict sandbox logic while remount, see https://github.com/umijs/qiankun/issues/518
+      initialAppWrapperGetter,
+      scopedCSS,
       useLooseSandbox,
       excludeAssetFilter,
     );
@@ -343,7 +348,20 @@ export async function loadApp<T extends object>(
     offGlobalStateChange,
   }: Record<string, Function> = getMicroAppStateActions(appInstanceId);
 
-  const parcelConfigGetter: ParcelConfigObjectGetter = (remountContainer) => {
+  // FIXME temporary way
+  const syncAppWrapperElement2Sandbox = (element: HTMLElement | null) => (initialAppWrapperElement = element);
+
+  const parcelConfigGetter: ParcelConfigObjectGetter = (remountContainer = initialContainer) => {
+    let appWrapperElement: HTMLElement | null = initialAppWrapperElement;
+    const appWrapperGetter = getAppWrapperGetter(
+      appName,
+      appInstanceId,
+      !!legacyRender,
+      strictStyleIsolation,
+      scopedCSS,
+      () => appWrapperElement,
+    );
+
     const parcelConfig: ParcelConfigObject = {
       name: appInstanceId,
       bootstrap,
@@ -366,16 +384,22 @@ export async function loadApp<T extends object>(
         },
         // 添加 mount hook, 确保每次应用加载前容器 dom 结构已经设置完毕
         async () => {
-          // element would be destroyed after unmounted, we need to recreate it if it not exist
-          appWrapperElement = appWrapperElement || createElement(appContent, strictStyleIsolation);
-          render({ element: appWrapperElement, loading: true, remountContainer }, 'mounting');
+          const useNewContainer = remountContainer !== initialContainer;
+          if (useNewContainer || !appWrapperElement) {
+            // element will be destroyed after unmounted, we need to recreate it if it not exist
+            // or we try to remount into a new container
+            appWrapperElement = createElement(appContent, strictStyleIsolation, scopedCSS, appName);
+            syncAppWrapperElement2Sandbox(appWrapperElement);
+          }
+
+          render({ element: appWrapperElement, loading: true, container: remountContainer }, 'mounting');
         },
         mountSandbox,
         // exec the chain after rendering to keep the behavior with beforeLoad
         async () => execHooksChain(toArray(beforeMount), app, global),
         async (props) => mount({ ...props, container: appWrapperGetter(), setGlobalState, onGlobalStateChange }),
         // finish loading after app mounted
-        async () => render({ element: appWrapperElement, loading: false, remountContainer }, 'mounted'),
+        async () => render({ element: appWrapperElement, loading: false, container: remountContainer }, 'mounted'),
         async () => execHooksChain(toArray(afterMount), app, global),
         // initialize the unmount defer after app mounted and resolve the defer after it unmounted
         async () => {
@@ -396,10 +420,11 @@ export async function loadApp<T extends object>(
         unmountSandbox,
         async () => execHooksChain(toArray(afterUnmount), app, global),
         async () => {
-          render({ element: null, loading: false, remountContainer }, 'unmounted');
+          render({ element: null, loading: false, container: remountContainer }, 'unmounted');
           offGlobalStateChange(appInstanceId);
           // for gc
           appWrapperElement = null;
+          syncAppWrapperElement2Sandbox(appWrapperElement);
         },
         async () => {
           if ((await validateSingularMode(singular, app)) && prevAppUnmountedDeferred) {

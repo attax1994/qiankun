@@ -40,8 +40,71 @@ export function isStyledComponentsLike(element: HTMLStyleElement) {
   );
 }
 
+function patchCustomEvent(
+  e: CustomEvent,
+  elementGetter: () => HTMLScriptElement | HTMLLinkElement | null,
+): CustomEvent {
+  Object.defineProperties(e, {
+    srcElement: {
+      get: elementGetter,
+    },
+    target: {
+      get: elementGetter,
+    },
+  });
+
+  return e;
+}
+
+function manualInvokeElementOnLoad(element: HTMLLinkElement | HTMLScriptElement) {
+  // we need to invoke the onload event manually to notify the event listener that the script was completed
+  // here are the two typical ways of dynamic script loading
+  // 1. element.onload callback way, which webpack and loadjs used, see https://github.com/muicss/loadjs/blob/master/src/loadjs.js#L138
+  // 2. addEventListener way, which toast-loader used, see https://github.com/pyrsmk/toast/blob/master/src/Toast.ts#L64
+  const loadEvent = new CustomEvent('load');
+  const patchedEvent = patchCustomEvent(loadEvent, () => element);
+  if (isFunction(element.onload)) {
+    element.onload(patchedEvent);
+  } else {
+    element.dispatchEvent(patchedEvent);
+  }
+}
+
+function manualInvokeElementOnError(element: HTMLLinkElement | HTMLScriptElement) {
+  const errorEvent = new CustomEvent('error');
+  const patchedEvent = patchCustomEvent(errorEvent, () => element);
+  if (isFunction(element.onerror)) {
+    element.onerror(patchedEvent);
+  } else {
+    element.dispatchEvent(patchedEvent);
+  }
+}
+
+function convertLinkAsStyle(
+  element: HTMLLinkElement,
+  postProcess: (styleElement: HTMLStyleElement) => void,
+  fetchFn = fetch,
+): HTMLStyleElement {
+  const styleElement = document.createElement('style');
+  const { href } = element;
+  // add source link element href
+  styleElement.dataset.qiankunHref = href;
+
+  fetchFn(href)
+    .then((res: any) => res.text())
+    .then((styleContext: string) => {
+      styleElement.appendChild(document.createTextNode(styleContext));
+      postProcess(styleElement);
+      manualInvokeElementOnLoad(element);
+    })
+    .catch(() => manualInvokeElementOnError(element));
+
+  return styleElement;
+}
+
 const styledComponentCSSRulesMap = new WeakMap<HTMLStyleElement, CSSRuleList>();
 const dynamicScriptAttachedCommentMap = new WeakMap<HTMLScriptElement, Comment>();
+const dynamicLinkAttachedInlineStyleMap = new WeakMap<HTMLLinkElement, HTMLStyleElement>();
 
 export function recordStyledComponentsCSSRules(styleElements: HTMLStyleElement[]): void {
   styleElements.forEach((styleElement) => {
@@ -61,18 +124,6 @@ export function recordStyledComponentsCSSRules(styleElements: HTMLStyleElement[]
 
 export function getStyledElementCSSRules(styledElement: HTMLStyleElement): CSSRuleList | undefined {
   return styledComponentCSSRulesMap.get(styledElement);
-}
-
-function patchCustomEvent(e: CustomEvent, elementGetter: () => HTMLScriptElement | null): CustomEvent {
-  Object.defineProperties(e, {
-    srcElement: {
-      get: elementGetter,
-    },
-    target: {
-      get: elementGetter,
-    },
-  });
-  return e;
 }
 
 export type ContainerConfig = {
@@ -97,7 +148,7 @@ function getOverwrittenAppendChildOrInsertBefore(opts: {
   ) {
     let element = newChild as any;
     const { rawDOMAppendOrInsertBefore, isInvokedByMicroApp, containerConfigGetter } = opts;
-    if (!isInvokedByMicroApp(element)) {
+    if (!isHijackingTag(element.tagName) || !isInvokedByMicroApp(element)) {
       return rawDOMAppendOrInsertBefore.call(this, element, refChild) as T;
     }
 
@@ -116,7 +167,7 @@ function getOverwrittenAppendChildOrInsertBefore(opts: {
       switch (element.tagName) {
         case LINK_TAG_NAME:
         case STYLE_TAG_NAME: {
-          const stylesheetElement: HTMLLinkElement | HTMLStyleElement = newChild as any;
+          let stylesheetElement: HTMLLinkElement | HTMLStyleElement = newChild as any;
           const { href } = stylesheetElement as HTMLLinkElement;
           if (excludeAssetFilter && href && excludeAssetFilter(href)) {
             return rawDOMAppendOrInsertBefore.call(this, element, refChild) as T;
@@ -125,7 +176,22 @@ function getOverwrittenAppendChildOrInsertBefore(opts: {
           const mountDOM = appWrapperGetter();
 
           if (scopedCSS) {
-            css.process(mountDOM, stylesheetElement, appName);
+            // exclude link elements like <link rel="icon" href="favicon.ico">
+            const linkElementUsingStylesheet =
+              element.tagName?.toUpperCase() === LINK_TAG_NAME &&
+              (element as HTMLLinkElement).rel === 'stylesheet' &&
+              (element as HTMLLinkElement).href;
+            if (linkElementUsingStylesheet) {
+              const { fetch } = frameworkConfiguration;
+              stylesheetElement = convertLinkAsStyle(
+                element,
+                (styleElement) => css.process(mountDOM, styleElement, appName),
+                fetch,
+              );
+              dynamicLinkAttachedInlineStyleMap.set(element, stylesheetElement);
+            } else {
+              css.process(mountDOM, stylesheetElement, appName);
+            }
           }
 
           // eslint-disable-next-line no-shadow
@@ -158,27 +224,11 @@ function getOverwrittenAppendChildOrInsertBefore(opts: {
                 });
               },
               success: () => {
-                // we need to invoke the onload event manually to notify the event listener that the script was completed
-                // here are the two typical ways of dynamic script loading
-                // 1. element.onload callback way, which webpack and loadjs used, see https://github.com/muicss/loadjs/blob/master/src/loadjs.js#L138
-                // 2. addEventListener way, which toast-loader used, see https://github.com/pyrsmk/toast/blob/master/src/Toast.ts#L64
-                const loadEvent = new CustomEvent('load');
-                if (isFunction(element.onload)) {
-                  element.onload(patchCustomEvent(loadEvent, () => element));
-                } else {
-                  element.dispatchEvent(loadEvent);
-                }
-
+                manualInvokeElementOnLoad(element);
                 element = null;
               },
               error: () => {
-                const errorEvent = new CustomEvent('error');
-                if (isFunction(element.onerror)) {
-                  element.onerror(patchCustomEvent(errorEvent, () => element));
-                } else {
-                  element.dispatchEvent(errorEvent);
-                }
-
+                manualInvokeElementOnError(element);
                 element = null;
               },
             });
@@ -188,11 +238,8 @@ function getOverwrittenAppendChildOrInsertBefore(opts: {
             return rawDOMAppendOrInsertBefore.call(mountDOM, dynamicScriptCommentElement, referenceNode);
           }
 
-          execScripts(null, [`<script>${text}</script>`], proxy, {
-            strictGlobal,
-            success: element.onload,
-            error: element.onerror,
-          });
+          // inline script never trigger the onload and onerror event
+          execScripts(null, [`<script>${text}</script>`], proxy, { strictGlobal });
           const dynamicInlineScriptCommentElement = document.createComment('dynamic inline script replaced by qiankun');
           dynamicScriptAttachedCommentMap.set(element, dynamicInlineScriptCommentElement);
           return rawDOMAppendOrInsertBefore.call(mountDOM, dynamicInlineScriptCommentElement, referenceNode);
@@ -212,17 +259,32 @@ function getNewRemoveChild(
   appWrapperGetterGetter: (element: HTMLElement) => ContainerConfig['appWrapperGetter'],
 ) {
   return function removeChild<T extends Node>(this: HTMLHeadElement | HTMLBodyElement, child: T) {
-    try {
-      const { tagName } = child as any;
-      if (isHijackingTag(tagName)) {
-        const appWrapperGetter = appWrapperGetterGetter(child as any);
+    const { tagName } = child as any;
+    if (!isHijackingTag(tagName)) return headOrBodyRemoveChild.call(this, child) as T;
 
-        // container may had been removed while app unmounting if the removeChild action was async
-        const container = appWrapperGetter();
-        const attachedElement = dynamicScriptAttachedCommentMap.get(child as any) || child;
-        if (container.contains(attachedElement)) {
-          return rawRemoveChild.call(container, attachedElement) as T;
+    try {
+      let attachedElement: Node;
+      switch (tagName) {
+        case LINK_TAG_NAME: {
+          attachedElement = (dynamicLinkAttachedInlineStyleMap.get(child as any) as Node) || child;
+          break;
         }
+
+        case SCRIPT_TAG_NAME: {
+          attachedElement = (dynamicScriptAttachedCommentMap.get(child as any) as Node) || child;
+          break;
+        }
+
+        default: {
+          attachedElement = child;
+        }
+      }
+
+      // container may had been removed while app unmounting if the removeChild action was async
+      const appWrapperGetter = appWrapperGetterGetter(child as any);
+      const container = appWrapperGetter();
+      if (container.contains(attachedElement)) {
+        return rawRemoveChild.call(container, attachedElement) as T;
       }
     } catch (e) {
       console.warn(e);
@@ -291,7 +353,6 @@ export function rebuildCSSRules(
 ) {
   styleSheetElements.forEach((stylesheetElement) => {
     // re-append the dynamic stylesheet to sub-app container
-    // Using document.head.appendChild ensures that appendChild invocation can also directly use the HTMLHeadElement.prototype.appendChild method which is overwritten at mounting phase
     reAppendElement(stylesheetElement);
 
     /*
