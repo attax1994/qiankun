@@ -88,9 +88,7 @@
     "typescript": "^3.4.5"
   },
   "husky": {
-    "hooks": {
-      "pre-push": "yarn test"
-    }
+    "hooks": {}
   },
   "lint-staged": {
     "**/*.{js,ts,json,css,md}": [
